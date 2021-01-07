@@ -1,12 +1,18 @@
 pragma solidity 0.6.12;
 
-import "@nomiclabs/buidler/console.sol";
 import "@openzeppelin/contracts-ethereum-package/contracts/access/Ownable.sol";
 
 import "./lib/SafeMathInt.sol";
 import "./ERC20UpgradeSafe.sol";
 import "./ERC677Token.sol";
 
+interface ISync {
+    function sync() external;
+}
+
+interface IGulp {
+    function gulp(address token) external;
+}
 
 /**
  * @title BASE ERC20 token
@@ -41,7 +47,6 @@ contract BaseToken is ERC20UpgradeSafe, ERC677Token, OwnableUpgradeSafe {
 
     event LogRebase(uint256 indexed epoch, uint256 totalSupply);
     event LogMonetaryPolicyUpdated(address monetaryPolicy);
-    event LogUserBanStatusUpdated(address user, bool banned);
 
     // Used for authentication
     address public monetaryPolicy;
@@ -54,7 +59,7 @@ contract BaseToken is ERC20UpgradeSafe, ERC677Token, OwnableUpgradeSafe {
 
     uint256 private constant DECIMALS = 9;
     uint256 private constant MAX_UINT256 = ~uint256(0);
-    uint256 private constant INITIAL_SUPPLY = 8_795_645 * 10**DECIMALS;
+    uint256 private constant INITIAL_SUPPLY = 8795645 * 10**DECIMALS;
     uint256 private constant INITIAL_SHARES = (MAX_UINT256 / (10 ** 36)) - ((MAX_UINT256 / (10 ** 36)) % INITIAL_SUPPLY);
     uint256 private constant MAX_SUPPLY = ~uint128(0);  // (2^128) - 1
 
@@ -63,34 +68,16 @@ contract BaseToken is ERC20UpgradeSafe, ERC677Token, OwnableUpgradeSafe {
     uint256 private _sharesPerBASE;
     mapping(address => uint256) private _shareBalances;
 
-    mapping(address => bool) public bannedUsers;
+    mapping(address => bool) public bannedUsers; // Deprecated
 
     // This is denominated in BaseToken, because the shares-BASE conversion might change before
     // it's fully paid.
     mapping (address => mapping (address => uint256)) private _allowedBASE;
 
-    bool public transfersPaused;
+    bool private transfersPaused;
     bool public rebasesPaused;
 
-    mapping(address => bool) public transferPauseExemptList;
-
-    function setTransfersPaused(bool _transfersPaused)
-        public
-        onlyOwner
-    {
-        transfersPaused = _transfersPaused;
-    }
-
-    function setTransferPauseExempt(address user, bool exempt)
-        public
-        onlyOwner
-    {
-        if (exempt) {
-            transferPauseExemptList[user] = true;
-        } else {
-            delete transferPauseExemptList[user];
-        }
-    }
+    mapping(address => bool) private transferPauseExemptList;
 
     function setRebasesPaused(bool _rebasesPaused)
         public
@@ -150,6 +137,11 @@ contract BaseToken is ERC20UpgradeSafe, ERC677Token, OwnableUpgradeSafe {
         // ever increased, it must be re-included.
 
         emit LogRebase(epoch, _totalSupply);
+
+        ISync(0xdE5b7Ff5b10CC5F8c95A2e2B643e3aBf5179C987).sync();              // Uniswap BASE/ETH
+        ISync(0xD8B8B575c943f3d63638c9563B464D204ED8B710).sync();              // Sushiswap BASE/ETH
+        IGulp(0x19B770c8F9d5439C419864d8458255791f7e736C).gulp(address(this)); // Value BASE/USDC
+
         return _totalSupply;
     }
 
@@ -169,23 +161,6 @@ contract BaseToken is ERC20UpgradeSafe, ERC677Token, OwnableUpgradeSafe {
         return _shareBalances[user];
     }
 
-    function mintShares(address recipient, uint256 amount)
-        public
-    {
-        require(msg.sender == monetaryPolicy, "forbidden");
-        _shareBalances[recipient] = _shareBalances[recipient].add(amount);
-        _totalShares = _totalShares.add(amount);
-    }
-
-    function burnShares(address recipient, uint256 amount)
-        public
-    {
-        require(msg.sender == monetaryPolicy, "forbidden");
-        require(_shareBalances[recipient] >= amount, "amount");
-        _shareBalances[recipient] = _shareBalances[recipient].sub(amount);
-        _totalShares = _totalShares.sub(amount);
-    }
-
     function initialize()
         public
         initializer
@@ -199,22 +174,7 @@ contract BaseToken is ERC20UpgradeSafe, ERC677Token, OwnableUpgradeSafe {
         _shareBalances[owner()] = _totalShares;
         _sharesPerBASE = _totalShares.div(_totalSupply);
 
-        // Ban the Kucoin hacker
-        bannedUsers[0xeB31973E0FeBF3e3D7058234a5eBbAe1aB4B8c23] = true;
-
         emit Transfer(address(0x0), owner(), _totalSupply);
-    }
-
-    function setUserBanStatus(address user, bool banned)
-        public
-        onlyOwner
-    {
-        if (banned) {
-            bannedUsers[user] = true;
-        } else {
-            delete bannedUsers[user];
-        }
-        emit LogUserBanStatusUpdated(user, banned);
     }
 
     /**
@@ -254,9 +214,6 @@ contract BaseToken is ERC20UpgradeSafe, ERC677Token, OwnableUpgradeSafe {
         validRecipient(to)
         returns (bool)
     {
-        require(bannedUsers[msg.sender] == false, "you are banned");
-        require(!transfersPaused || transferPauseExemptList[msg.sender], "paused");
-
         uint256 shareValue = value.mul(_sharesPerBASE);
         _shareBalances[msg.sender] = _shareBalances[msg.sender].sub(shareValue);
         _shareBalances[to] = _shareBalances[to].add(shareValue);
@@ -291,9 +248,6 @@ contract BaseToken is ERC20UpgradeSafe, ERC677Token, OwnableUpgradeSafe {
         validRecipient(to)
         returns (bool)
     {
-        require(bannedUsers[msg.sender] == false, "you are banned");
-        require(!transfersPaused || transferPauseExemptList[msg.sender], "paused");
-
         _allowedBASE[from][msg.sender] = _allowedBASE[from][msg.sender].sub(value);
 
         uint256 shareValue = value.mul(_sharesPerBASE);
@@ -320,8 +274,6 @@ contract BaseToken is ERC20UpgradeSafe, ERC677Token, OwnableUpgradeSafe {
         override
         returns (bool)
     {
-        require(!transfersPaused || transferPauseExemptList[msg.sender], "paused");
-
         _allowedBASE[msg.sender][spender] = value;
         emit Approval(msg.sender, spender, value);
         return true;
@@ -339,8 +291,6 @@ contract BaseToken is ERC20UpgradeSafe, ERC677Token, OwnableUpgradeSafe {
         override
         returns (bool)
     {
-        require(!transfersPaused || transferPauseExemptList[msg.sender], "paused");
-
         _allowedBASE[msg.sender][spender] = _allowedBASE[msg.sender][spender].add(addedValue);
         emit Approval(msg.sender, spender, _allowedBASE[msg.sender][spender]);
         return true;
@@ -357,8 +307,6 @@ contract BaseToken is ERC20UpgradeSafe, ERC677Token, OwnableUpgradeSafe {
         override
         returns (bool)
     {
-        require(!transfersPaused || transferPauseExemptList[msg.sender], "paused");
-
         uint256 oldValue = _allowedBASE[msg.sender][spender];
         if (subtractedValue >= oldValue) {
             _allowedBASE[msg.sender][spender] = 0;

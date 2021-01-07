@@ -9,7 +9,7 @@ import "./BaseToken.sol";
 
 
 interface IOracle {
-    function getData() external returns (uint256, bool);
+    function getData() external view returns (uint256, bool);
 }
 
 
@@ -82,13 +82,13 @@ contract BaseTokenMonetaryPolicy is OwnableUpgradeSafe {
     // This module orchestrates the rebase execution and downstream notification.
     address public orchestrator;
 
-    address[] public charityRecipients;
-    mapping(address => bool)    public charityExists;
-    mapping(address => uint256) public charityIndex;
-    mapping(address => uint256) public charityPercentOnExpansion;
-    mapping(address => uint256) public charityPercentOnContraction;
-    uint256 public totalCharityPercentOnExpansion;
-    uint256 public totalCharityPercentOnContraction;
+    address[] private charityRecipients;
+    mapping(address => bool)    private charityExists;
+    mapping(address => uint256) private charityIndex;
+    mapping(address => uint256) private charityPercentOnExpansion;
+    mapping(address => uint256) private charityPercentOnContraction;
+    uint256 private totalCharityPercentOnExpansion;
+    uint256 private totalCharityPercentOnContraction;
 
     function setBASEToken(address _BASE)
         public
@@ -116,12 +116,33 @@ contract BaseTokenMonetaryPolicy is OwnableUpgradeSafe {
 
         epoch = epoch.add(1);
 
+        int256 supplyDelta;
+        uint256 mcap;
+        uint256 tokenPrice;
+        (supplyDelta, mcap, tokenPrice) = getNextSupplyDelta();
+        if (supplyDelta == 0) {
+            emit LogRebase(epoch, tokenPrice, mcap, supplyDelta, now);
+            return;
+        }
+
+        if (supplyDelta > 0 && BASE.totalSupply().add(uint256(supplyDelta)) > MAX_SUPPLY) {
+            supplyDelta = (MAX_SUPPLY.sub(BASE.totalSupply())).toInt256Safe();
+        }
+
+        uint256 nextSupply = BASE.rebase(epoch, supplyDelta);
+        assert(nextSupply <= MAX_SUPPLY);
+        emit LogRebase(epoch, tokenPrice, mcap, supplyDelta, now);
+    }
+
+    function getNextSupplyDelta()
+        public
+        view
+        returns (int256 supplyDelta, uint256 mcap, uint256 tokenPrice)
+    {
         uint256 mcap;
         bool mcapValid;
         (mcap, mcapValid) = mcapOracle.getData();
         require(mcapValid, "invalid mcap");
-
-        uint256 targetPrice = mcap.div(1_000_000_000_000);
 
         uint256 tokenPrice;
         bool tokenPriceValid;
@@ -132,93 +153,11 @@ contract BaseTokenMonetaryPolicy is OwnableUpgradeSafe {
             tokenPrice = MAX_RATE;
         }
 
-        int256 supplyDelta = computeSupplyDelta(tokenPrice, targetPrice);
+        supplyDelta = computeSupplyDelta(tokenPrice, mcap);
 
         // Apply the Dampening factor.
         supplyDelta = supplyDelta.div(rebaseLag.toInt256Safe());
-
-        if (supplyDelta == 0) {
-            emit LogRebase(epoch, tokenPrice, mcap, supplyDelta, now);
-            return;
-        }
-
-        if (supplyDelta > 0 && BASE.totalSupply().add(uint256(supplyDelta)) > MAX_SUPPLY) {
-            supplyDelta = (MAX_SUPPLY.sub(BASE.totalSupply())).toInt256Safe();
-        }
-
-        applyCharity(supplyDelta);
-        uint256 supplyAfterRebase = BASE.rebase(epoch, supplyDelta);
-        assert(supplyAfterRebase <= MAX_SUPPLY);
-        emit LogRebase(epoch, tokenPrice, mcap, supplyDelta, now);
-    }
-
-    function applyCharity(int256 supplyDelta)
-        private
-    {
-        uint256 totalCharityPercent = supplyDelta < 0 ? totalCharityPercentOnContraction
-                                                      : totalCharityPercentOnExpansion;
-
-        uint256 totalCharitySupply = uint256(supplyDelta.abs()).mul(totalCharityPercent).div(100);
-        uint256 supplyAfterRebase = (supplyDelta < 0) ? BASE.totalSupply().sub(uint256(supplyDelta.abs()))
-                                                      : BASE.totalSupply().add(uint256(supplyDelta));
-
-        uint256 totalSharesDelta = totalCharitySupply.mul(BASE.totalShares())
-                            .div(//------------------------------------------
-                                   supplyAfterRebase.sub(totalCharitySupply)
-                             );
-
-        // Overflow protection without reverting.  If an overflow will occur, the charity program is finished.
-        if (BASE.totalShares() + totalSharesDelta < BASE.totalShares()) {
-            return;
-        }
-
-        for (uint256 i = 0; i < charityRecipients.length; i++) {
-            address recipient = charityRecipients[i];
-            uint256 recipientPercent = supplyDelta < 0 ? charityPercentOnContraction[recipient]
-                                                       : charityPercentOnExpansion[recipient];
-            if (recipientPercent == 0) {
-                continue;
-            }
-
-            uint256 recipientSharesDelta = totalSharesDelta.mul(recipientPercent).div(totalCharityPercent);
-            BASE.mintShares(recipient, recipientSharesDelta);
-        }
-    }
-
-    function addCharityRecipient(address addr, uint256 percentOnExpansion, uint256 percentOnContraction)
-        external
-        onlyOwner
-    {
-        require(totalCharityPercentOnExpansion.add(percentOnExpansion) <= 100, "expansion");
-        require(totalCharityPercentOnContraction.add(percentOnContraction) <= 100, "contraction");
-        require(charityExists[addr] == false, "already exists");
-
-        totalCharityPercentOnExpansion = totalCharityPercentOnExpansion.add(percentOnExpansion);
-        totalCharityPercentOnContraction = totalCharityPercentOnContraction.add(percentOnContraction);
-        charityExists[addr] = true;
-        charityIndex[addr] = charityRecipients.length;
-        charityPercentOnExpansion[addr] = percentOnExpansion;
-        charityPercentOnContraction[addr] = percentOnContraction;
-        charityRecipients.push(addr);
-    }
-
-    function removeCharityRecipient(address addr)
-        external
-        onlyOwner
-    {
-        require(charityExists[addr], "doesn't exist");
-        require(charityRecipients.length > 0, "spacetime has shattered");
-        require(charityRecipients.length - 1 >= charityIndex[addr], "too much cosmic radiation");
-
-        totalCharityPercentOnExpansion = totalCharityPercentOnExpansion.sub(charityPercentOnExpansion[addr]);
-        totalCharityPercentOnContraction = totalCharityPercentOnContraction.sub(charityPercentOnContraction[addr]);
-
-        charityRecipients[charityIndex[addr]] = charityRecipients[charityRecipients.length - 1];
-        charityRecipients.pop();
-        delete charityExists[addr];
-        delete charityIndex[addr];
-        delete charityPercentOnExpansion[addr];
-        delete charityPercentOnContraction[addr];
+        return (supplyDelta, mcap, tokenPrice);
     }
 
     /**
@@ -347,20 +286,21 @@ contract BaseTokenMonetaryPolicy is OwnableUpgradeSafe {
      * @return Computes the total supply adjustment in response to the exchange rate
      *         and the targetRate.
      */
-    function computeSupplyDelta(uint256 rate, uint256 targetRate)
-        private
+    function computeSupplyDelta(uint256 price, uint256 mcap)
+        public
         view
         returns (int256)
     {
-        if (withinDeviationThreshold(rate, targetRate)) {
+        if (withinDeviationThreshold(price, mcap.div(1000000000000))) {
             return 0;
         }
 
-        // supplyDelta = totalSupply * (rate - targetRate) / targetRate
-        int256 targetRateSigned = targetRate.toInt256Safe();
+        // supplyDelta = totalSupply * (price - targetPrice) / targetPrice
+        int256 pricex1T       = price.mul(1000000000000).toInt256Safe();
+        int256 targetPricex1T = mcap.toInt256Safe();
         return BASE.totalSupply().toInt256Safe()
-            .mul(rate.toInt256Safe().sub(targetRateSigned))
-            .div(targetRateSigned);
+            .mul(pricex1T.sub(targetPricex1T))
+            .div(targetPricex1T);
     }
 
     /**

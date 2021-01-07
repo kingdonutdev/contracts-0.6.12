@@ -9,11 +9,10 @@ contract Cascade is OwnableUpgradeSafe {
     using SafeMath for uint256;
     using SafeMathInt for int256;
 
-    mapping(address => uint256) internal deposits_lpTokensDeposited;
-    mapping(address => uint256) internal deposits_depositTimestamp;
-    mapping(address => uint8)   internal deposits_multiplierLevel;
-    mapping(address => uint256) internal deposits_mostRecentBASEWithdrawal;
-
+    mapping(address => uint256) public deposits_lpTokensDeposited;
+    mapping(address => uint256) public deposits_depositTimestamp;
+    mapping(address => uint8)   public deposits_multiplierLevel;
+    mapping(address => uint256) public deposits_mostRecentBASEWithdrawal;
 
     uint256 public totalDepositedLevel1;
     uint256 public totalDepositedLevel2;
@@ -22,9 +21,20 @@ contract Cascade is OwnableUpgradeSafe {
     uint256 public totalDepositSecondsLevel2;
     uint256 public totalDepositSecondsLevel3;
     uint256 public lastAccountingUpdateTimestamp;
+
     IERC20 public lpToken;
     BaseToken public BASE;
     uint256 public minTimeBetweenWithdrawals;
+
+    uint256 public rewardsStartTimestamp;
+    uint256 public rewardsDuration;
+
+    mapping(address => uint256) public deposits_lastMultiplierUpgradeTimestamp;
+    uint256 multiplierUpgradeTimeout;
+
+    event Deposit(address indexed user, uint256 previousLPTokens, uint256 additionalTokens, uint256 timestamp);
+    event Withdraw(address indexed user, uint256 lpTokens, uint256 baseTokens, uint256 timestamp);
+    event UpgradeMultiplierLevel(address indexed user, uint8 oldLevel, uint256 newLevel, uint256 timestamp);
 
     function initialize()
         public
@@ -58,6 +68,21 @@ contract Cascade is OwnableUpgradeSafe {
         minTimeBetweenWithdrawals = _minTimeBetweenWithdrawals;
     }
 
+    function setRewardsParams(uint256 _rewardsStartTimestamp, uint256 _rewardsDuration)
+        public
+        onlyOwner
+    {
+        rewardsStartTimestamp = _rewardsStartTimestamp;
+        rewardsDuration = _rewardsDuration;
+    }
+
+    function setMultiplierUpgradeTimeout(uint256 _multiplierUpgradeTimeout)
+        public
+        onlyOwner
+    {
+        multiplierUpgradeTimeout = _multiplierUpgradeTimeout;
+    }
+
     function adminWithdrawBASE(address recipient, uint256 amount)
         public
         onlyOwner
@@ -87,23 +112,25 @@ contract Cascade is OwnableUpgradeSafe {
     function deposit(uint256 amount)
         public
     {
+        require(deposits_lastMultiplierUpgradeTimestamp[msg.sender] == 0, "multiplied too recently");
+
         updateDepositSeconds();
 
         uint256 allowance = lpToken.allowance(msg.sender, address(this));
         require(amount <= allowance, "allowance");
 
-        if (deposits_multiplierLevel[msg.sender] > 0) {
-            burnDepositSeconds(msg.sender);
-        }
-
         totalDepositedLevel1 = totalDepositedLevel1.add(amount);
 
         deposits_lpTokensDeposited[msg.sender] = deposits_lpTokensDeposited[msg.sender].add(amount);
-        deposits_depositTimestamp[msg.sender] = now;
         deposits_multiplierLevel[msg.sender] = 1;
+        if (deposits_depositTimestamp[msg.sender] == 0) {
+            deposits_depositTimestamp[msg.sender] = now;
+        }
 
         bool ok = lpToken.transferFrom(msg.sender, address(this), amount);
         require(ok, "transferFrom");
+
+        emit Deposit(msg.sender, deposits_lpTokensDeposited[msg.sender].sub(amount), amount, now);
     }
 
     function upgradeMultiplierLevel()
@@ -112,55 +139,72 @@ contract Cascade is OwnableUpgradeSafe {
         require(deposits_multiplierLevel[msg.sender] > 0, "no deposit");
         require(deposits_multiplierLevel[msg.sender] < 3, "fully upgraded");
 
-        burnDepositSeconds(msg.sender);
+        deposits_lastMultiplierUpgradeTimestamp[msg.sender] = block.timestamp;
 
-        uint256 duration = now.sub(deposits_depositTimestamp[msg.sender]);
+        updateDepositSeconds();
 
-        if (deposits_multiplierLevel[msg.sender] == 1 && duration >= 60 days) {
+        uint8 oldLevel = deposits_multiplierLevel[msg.sender];
+        uint256 age = now.sub(deposits_depositTimestamp[msg.sender]);
+        uint256 lpTokensDeposited = deposits_lpTokensDeposited[msg.sender];
+
+        if (deposits_multiplierLevel[msg.sender] == 1 && age >= 60 days) {
+            uint256 secondsSinceLevel2 = age.sub(30 days);
+            uint256 secondsSinceLevel3 = age.sub(60 days);
+            totalDepositedLevel1 = totalDepositedLevel1.sub(lpTokensDeposited);
+            totalDepositedLevel3 = totalDepositedLevel3.add(lpTokensDeposited);
+            totalDepositSecondsLevel2 = totalDepositSecondsLevel2.add( lpTokensDeposited.mul(secondsSinceLevel2) );
+            totalDepositSecondsLevel3 = totalDepositSecondsLevel3.add( lpTokensDeposited.mul(secondsSinceLevel2.add(secondsSinceLevel3)) );
             deposits_multiplierLevel[msg.sender] = 3;
-            totalDepositedLevel3 = totalDepositedLevel3.add(deposits_lpTokensDeposited[msg.sender]);
 
-        } else if (deposits_multiplierLevel[msg.sender] == 1 && duration >= 30 days) {
+        } else if (deposits_multiplierLevel[msg.sender] == 1 && age >= 30 days) {
+            uint256 secondsSinceLevel2 = age.sub(30 days);
+            totalDepositedLevel1 = totalDepositedLevel1.sub(lpTokensDeposited);
+            totalDepositedLevel2 = totalDepositedLevel2.add(lpTokensDeposited);
+            totalDepositSecondsLevel1 = totalDepositSecondsLevel1.sub( lpTokensDeposited.mul(secondsSinceLevel2) );
+            totalDepositSecondsLevel2 = totalDepositSecondsLevel2.add( lpTokensDeposited.mul(secondsSinceLevel2) );
             deposits_multiplierLevel[msg.sender] = 2;
-            totalDepositedLevel2 = totalDepositedLevel2.add(deposits_lpTokensDeposited[msg.sender]);
 
-        } else if (deposits_multiplierLevel[msg.sender] == 2 && duration >= 60 days) {
+        } else if (deposits_multiplierLevel[msg.sender] == 2 && age >= 60 days) {
+            uint256 secondsSinceLevel3 = age.sub(60 days);
+            totalDepositedLevel2 = totalDepositedLevel2.sub(lpTokensDeposited);
+            totalDepositedLevel3 = totalDepositedLevel3.add(lpTokensDeposited);
+            totalDepositSecondsLevel3 = totalDepositSecondsLevel3.add( lpTokensDeposited.mul(secondsSinceLevel3) );
             deposits_multiplierLevel[msg.sender] = 3;
-            totalDepositedLevel3 = totalDepositedLevel3.add(deposits_lpTokensDeposited[msg.sender]);
 
         } else {
             revert("ineligible");
         }
-    }
 
-    function claimBASE()
-        public
-    {
-        updateDepositSeconds();
-
-        require(deposits_multiplierLevel[msg.sender] > 0, "doesn't exist");
-        require(allowedToWithdraw(msg.sender), "too soon");
-
-        uint256 owed = owedTo(msg.sender);
-        require(BASE.balanceOf(address(this)) >= owed, "available tokens");
-
-        deposits_mostRecentBASEWithdrawal[msg.sender] = now;
-
-        bool ok = BASE.transfer(msg.sender, owed);
-        require(ok, "transfer");
+        emit UpgradeMultiplierLevel(msg.sender, oldLevel, deposits_multiplierLevel[msg.sender], now);
     }
 
     function withdrawLPTokens()
         public
     {
-        updateDepositSeconds();
-        claimBASE();
+        require(deposits_lastMultiplierUpgradeTimestamp[msg.sender] == 0, "multiplied too recently");
 
+        updateDepositSeconds();
+
+        uint256 owed = owedTo(msg.sender);
+        require(BASE.balanceOf(address(this)) >= owed, "available tokens");
         require(deposits_multiplierLevel[msg.sender] > 0, "doesn't exist");
         require(deposits_lpTokensDeposited[msg.sender] > 0, "no stake");
         require(allowedToWithdraw(msg.sender), "too soon");
 
-        burnDepositSeconds(msg.sender);
+        deposits_mostRecentBASEWithdrawal[msg.sender] = now;
+
+        (uint256 level1, uint256 level2, uint256 level3) = userDepositSeconds(msg.sender);
+        totalDepositSecondsLevel1 = totalDepositSecondsLevel1.sub(level1);
+        totalDepositSecondsLevel2 = totalDepositSecondsLevel2.sub(level2);
+        totalDepositSecondsLevel3 = totalDepositSecondsLevel3.sub(level3);
+
+        if (deposits_multiplierLevel[msg.sender] == 1) {
+            totalDepositedLevel1 = totalDepositedLevel1.sub(deposits_lpTokensDeposited[msg.sender]);
+        } else if (deposits_multiplierLevel[msg.sender] == 2) {
+            totalDepositedLevel2 = totalDepositedLevel2.sub(deposits_lpTokensDeposited[msg.sender]);
+        } else if (deposits_multiplierLevel[msg.sender] == 3) {
+            totalDepositedLevel3 = totalDepositedLevel3.sub(deposits_lpTokensDeposited[msg.sender]);
+        }
 
         uint256 deposited = deposits_lpTokensDeposited[msg.sender];
 
@@ -171,6 +215,10 @@ contract Cascade is OwnableUpgradeSafe {
 
         bool ok = lpToken.transfer(msg.sender, deposited);
         require(ok, "transfer");
+        ok = BASE.transfer(msg.sender, owed);
+        require(ok, "transfer");
+
+        emit Withdraw(msg.sender, deposited, owed, now);
     }
 
     /**
@@ -178,32 +226,23 @@ contract Cascade is OwnableUpgradeSafe {
      */
 
     function updateDepositSeconds()
-        private
+        public
     {
-        uint256 delta = now.sub(lastAccountingUpdateTimestamp);
-        totalDepositSecondsLevel1 = totalDepositSecondsLevel1.add(totalDepositedLevel1.mul(delta));
-        totalDepositSecondsLevel2 = totalDepositSecondsLevel2.add(totalDepositedLevel2.mul(delta));
-        totalDepositSecondsLevel3 = totalDepositSecondsLevel3.add(totalDepositedLevel3.mul(delta));
-
+        (totalDepositSecondsLevel1, totalDepositSecondsLevel2, totalDepositSecondsLevel3) = getUpdatedDepositSeconds();
         lastAccountingUpdateTimestamp = now;
     }
 
-    function burnDepositSeconds(address user)
-        private
+    function getUpdatedDepositSeconds()
+        public
+        view
+        returns (uint256 level1, uint256 level2, uint256 level3)
     {
-        uint256 depositSecondsToBurn = now.sub(deposits_depositTimestamp[user]).mul(deposits_lpTokensDeposited[user]);
-        if (deposits_multiplierLevel[user] == 1) {
-            totalDepositedLevel1 = totalDepositedLevel1.sub(deposits_lpTokensDeposited[user]);
-            totalDepositSecondsLevel1 = totalDepositSecondsLevel1.sub(depositSecondsToBurn);
-
-        } else if (deposits_multiplierLevel[user] == 2) {
-            totalDepositedLevel2 = totalDepositedLevel2.sub(deposits_lpTokensDeposited[user]);
-            totalDepositSecondsLevel2 = totalDepositSecondsLevel2.sub(depositSecondsToBurn);
-
-        } else if (deposits_multiplierLevel[user] == 3) {
-            totalDepositedLevel3 = totalDepositedLevel3.sub(deposits_lpTokensDeposited[user]);
-            totalDepositSecondsLevel3 = totalDepositSecondsLevel3.sub(depositSecondsToBurn);
-        }
+        uint256 delta = now.sub(lastAccountingUpdateTimestamp);
+        return (
+            totalDepositSecondsLevel1.add(totalDepositedLevel1.mul(delta)),
+            totalDepositSecondsLevel2.add(totalDepositedLevel2.mul(delta)),
+            totalDepositSecondsLevel3.add(totalDepositedLevel3.mul(delta))
+        );
     }
 
     /**
@@ -232,7 +271,7 @@ contract Cascade is OwnableUpgradeSafe {
             deposits_depositTimestamp[user],
             deposits_multiplierLevel[user],
             deposits_mostRecentBASEWithdrawal[user],
-            userDepositSeconds(user),
+            sumOfUserDepositSeconds(user),
             _totalDepositSeconds
         );
     }
@@ -250,11 +289,39 @@ contract Cascade is OwnableUpgradeSafe {
     function userDepositSeconds(address user)
         public
         view
+        returns (uint256 level1, uint256 level2, uint256 level3)
+    {
+        uint256 timeSinceDeposit = now.sub(deposits_depositTimestamp[user]);
+        uint256 multiplier = deposits_multiplierLevel[user];
+        uint256 lpTokens = deposits_lpTokensDeposited[user];
+        uint256 secondsLevel1;
+        uint256 secondsLevel2;
+        uint256 secondsLevel3;
+        if (multiplier == 1) {
+            secondsLevel1 = timeSinceDeposit;
+        } else if (multiplier == 2) {
+            secondsLevel1 = 30 days;
+            secondsLevel2 = timeSinceDeposit.sub(30 days);
+        } else if (multiplier == 3) {
+            secondsLevel1 = 30 days;
+            secondsLevel2 = 30 days;
+            secondsLevel3 = timeSinceDeposit.sub(60 days);
+        }
+
+        return (
+            lpTokens.mul(secondsLevel1),
+            lpTokens.mul(secondsLevel2),
+            lpTokens.mul(secondsLevel3)
+        );
+    }
+
+    function sumOfUserDepositSeconds(address user)
+        public
+        view
         returns (uint256)
     {
-        return deposits_lpTokensDeposited[user]
-                  .mul(now.sub(deposits_depositTimestamp[user]))
-                  .mul(deposits_multiplierLevel[user]);
+        (uint256 level1, uint256 level2, uint256 level3) = userDepositSeconds(user);
+        return level1.add(level2.mul(2)).add(level3.mul(3));
     }
 
     function totalDepositSeconds()
@@ -262,9 +329,8 @@ contract Cascade is OwnableUpgradeSafe {
         view
         returns (uint256)
     {
-        return totalDepositSecondsLevel1
-                  .add(totalDepositSecondsLevel2.mul(2))
-                  .add(totalDepositSecondsLevel3.mul(3));
+        (uint256 level1, uint256 level2, uint256 level3) = getUpdatedDepositSeconds();
+        return level1.add(level2.mul(2)).add(level3.mul(3));
     }
 
     function rewardsPool()
@@ -272,7 +338,19 @@ contract Cascade is OwnableUpgradeSafe {
         view
         returns (uint256)
     {
-        return BASE.balanceOf(address(this));
+        uint256 baseBalance = BASE.balanceOf(address(this));
+        uint256 unlocked;
+        if (rewardsStartTimestamp > 0) {
+            uint256 secondsIntoVesting = now.sub(rewardsStartTimestamp);
+            if (secondsIntoVesting > rewardsDuration) {
+                unlocked = baseBalance;
+            } else {
+                unlocked = baseBalance.mul( now.sub(rewardsStartTimestamp) ).div(rewardsDuration);
+            }
+        } else {
+            unlocked = baseBalance;
+        }
+        return unlocked;
     }
 
     function owedTo(address user)
@@ -280,6 +358,9 @@ contract Cascade is OwnableUpgradeSafe {
         view
         returns (uint256 amount)
     {
-        return rewardsPool().mul(userDepositSeconds(user)).div(totalDepositSeconds());
+        if (totalDepositSeconds() == 0) {
+            return 0;
+        }
+        return rewardsPool().mul(sumOfUserDepositSeconds(user)).div(totalDepositSeconds());
     }
 }

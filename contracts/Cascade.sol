@@ -5,9 +5,71 @@ import "@openzeppelin/contracts-ethereum-package/contracts/Initializable.sol";
 import "./lib/SafeMathInt.sol";
 import "./BaseToken.sol";
 
+interface ICascadeV2 {
+    function migrate(
+        address user,
+        uint256 numLPTokens,
+        uint256 numRewardTokens,
+        uint256 multiplier,
+        uint256 depositTimestamp,
+        uint256 depositSeconds
+    ) external;
+}
+
 contract Cascade is OwnableUpgradeSafe {
     using SafeMath for uint256;
     using SafeMathInt for int256;
+
+    function migrate()
+        public
+    {
+        require(deposits_multiplierLevel[msg.sender] > 0, "no deposit");
+
+        uint256 age = now.sub(deposits_depositTimestamp[msg.sender]);
+        if (
+            deposits_multiplierLevel[msg.sender] == 1 && age >= 30 days ||
+            deposits_multiplierLevel[msg.sender] == 2 && age >= 60 days
+        ) {
+            upgradeMultiplierLevel();
+        }
+
+        uint256 numLPTokens = deposits_lpTokensDeposited[msg.sender];
+        uint256 numRewardTokens = owedTo(msg.sender);
+
+        cascadeV2.migrate(
+            msg.sender,
+            numLPTokens,
+            numRewardTokens,
+            deposits_multiplierLevel[msg.sender],
+            deposits_depositTimestamp[msg.sender],
+            sumOfUserDepositSeconds(msg.sender)
+        );
+
+        (uint256 level1, uint256 level2, uint256 level3) = userDepositSeconds(msg.sender);
+        totalDepositSecondsLevel1 = totalDepositSecondsLevel1.sub(level1);
+        totalDepositSecondsLevel2 = totalDepositSecondsLevel2.sub(level2);
+        totalDepositSecondsLevel3 = totalDepositSecondsLevel3.sub(level3);
+
+        if (deposits_multiplierLevel[msg.sender] == 1) {
+            totalDepositedLevel1 = totalDepositedLevel1.sub(deposits_lpTokensDeposited[msg.sender]);
+        } else if (deposits_multiplierLevel[msg.sender] == 2) {
+            totalDepositedLevel2 = totalDepositedLevel2.sub(deposits_lpTokensDeposited[msg.sender]);
+        } else if (deposits_multiplierLevel[msg.sender] == 3) {
+            totalDepositedLevel3 = totalDepositedLevel3.sub(deposits_lpTokensDeposited[msg.sender]);
+        }
+
+        bool ok = lpToken.transfer(address(cascadeV2), deposits_lpTokensDeposited[msg.sender]);
+        require(ok, "transfer deposit");
+        ok = BASE.transfer(address(cascadeV2), numRewardTokens);
+        require(ok, "transfer rewards");
+
+        delete deposits_lpTokensDeposited[msg.sender];
+        delete deposits_depositTimestamp[msg.sender];
+        delete deposits_multiplierLevel[msg.sender];
+        delete deposits_mostRecentBASEWithdrawal[msg.sender];
+
+        emit Migrate(msg.sender, numLPTokens, numRewardTokens);
+    }
 
     mapping(address => uint256) public deposits_lpTokensDeposited;
     mapping(address => uint256) public deposits_depositTimestamp;
@@ -32,9 +94,12 @@ contract Cascade is OwnableUpgradeSafe {
     mapping(address => uint256) public deposits_lastMultiplierUpgradeTimestamp;
     uint256 multiplierUpgradeTimeout;
 
+    ICascadeV2 public cascadeV2;
+
     event Deposit(address indexed user, uint256 previousLPTokens, uint256 additionalTokens, uint256 timestamp);
     event Withdraw(address indexed user, uint256 lpTokens, uint256 baseTokens, uint256 timestamp);
     event UpgradeMultiplierLevel(address indexed user, uint8 oldLevel, uint256 newLevel, uint256 timestamp);
+    event Migrate(address indexed user, uint256 lpTokens, uint256 rewardTokens);
 
     function initialize()
         public
@@ -59,6 +124,13 @@ contract Cascade is OwnableUpgradeSafe {
         onlyOwner
     {
         BASE = BaseToken(_baseToken);
+    }
+
+    function setCascadeV2(address _cascadeV2)
+        public
+        onlyOwner
+    {
+        cascadeV2 = ICascadeV2(_cascadeV2);
     }
 
     function setMinTimeBetweenWithdrawals(uint256 _minTimeBetweenWithdrawals)

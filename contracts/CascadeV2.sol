@@ -3,6 +3,7 @@ pragma solidity 0.6.12;
 import "@openzeppelin/contracts-ethereum-package/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts-ethereum-package/contracts/Initializable.sol";
 import "./BaseToken.sol";
+import "./Cascade.sol";
 
 contract CascadeV2 is OwnableUpgradeSafe {
     using SafeMath for uint256;
@@ -22,15 +23,19 @@ contract CascadeV2 is OwnableUpgradeSafe {
     uint256 public totalDepositSeconds;
     uint256 public lastAccountingUpdateTimestamp;
 
-    uint256 public rewardsStartTimestamp;
-    uint256 public rewardsDuration;
+    uint256[] public rewards_numShares;
+    uint256[] public rewards_vestingStart;
+    uint256[] public rewards_vestingDuration;
 
     IERC20 public lpToken;
     BaseToken public BASE;
+    Cascade public cascadeV1;
 
     event Deposit(address indexed user, uint256 tokens, uint256 timestamp);
     event Withdraw(address indexed user, uint256 withdrawnLPTokens, uint256 withdrawnBASETokens, uint256 timestamp);
     event UpgradeMultiplierLevel(address indexed user, uint256 depositIndex, uint256 oldLevel, uint256 newLevel, uint256 timestamp);
+    event Migrate(address indexed user, uint256 lpTokens, uint256 rewardTokens);
+    event AddRewards(uint256 tokens, uint256 shares, uint256 vestingStart, uint256 vestingDuration, uint256 totalTranches);
 
     function initialize()
         public
@@ -66,6 +71,21 @@ contract CascadeV2 is OwnableUpgradeSafe {
 
         bool ok = IERC20(token).transfer(recipient, amount);
         require(ok, "transfer");
+    }
+
+    function addRewards(uint256 numTokens, uint256 vestingStart, uint256 vestingDuration)
+        public
+        onlyOwner
+    {
+        uint256 numShares = tokensToShares(numTokens);
+        rewards_numShares.push(numShares);
+        rewards_vestingStart.push(vestingStart);
+        rewards_vestingDuration.push(vestingDuration);
+
+        bool ok = BASE.transferFrom(msg.sender, address(this), numTokens);
+        require(ok, "transfer");
+
+        emit AddRewards(numTokens, numShares, vestingStart, vestingDuration, rewards_numShares.length);
     }
 
     /**
@@ -134,7 +154,8 @@ contract CascadeV2 is OwnableUpgradeSafe {
             totalDepositSecondsToBurn = totalDepositSecondsToBurn.add(depositSecondsToBurn);
         }
 
-        uint256 rewards = rewardsPool().mul( totalDepositSecondsToBurn.div(totalDepositSeconds) );
+        uint256 rewardTokens = rewardsPool().mul( totalDepositSecondsToBurn.div(totalDepositSeconds) );
+        removeRewards(rewardTokens);
 
         totalDepositedLevel1 = totalDepositedLevel1.sub(amountToWithdrawLevel1);
         totalDepositedLevel2 = totalDepositedLevel2.sub(amountToWithdrawLevel2);
@@ -145,10 +166,39 @@ contract CascadeV2 is OwnableUpgradeSafe {
 
         bool ok = lpToken.transfer(msg.sender, totalAmountToWithdraw);
         require(ok, "transfer deposit");
-        ok = BASE.transfer(msg.sender, rewards);
+        ok = BASE.transfer(msg.sender, rewardTokens);
         require(ok, "transfer rewards");
 
-        emit Withdraw(msg.sender, totalAmountToWithdraw, rewards, block.timestamp);
+        emit Withdraw(msg.sender, totalAmountToWithdraw, rewardTokens, block.timestamp);
+    }
+
+    function removeRewards(uint256 rewardTokens)
+        private
+    {
+        uint256 totalSharesToRemove = tokensToShares(rewardTokens);
+        uint256 totalSharesRemovedSoFar;
+        uint256 i;
+        while (totalSharesRemovedSoFar < totalSharesToRemove) {
+            uint256 sharesAvailable = unlockedRewardShares(i);
+            uint256 sharesStillNeeded = totalSharesToRemove.sub(totalSharesRemovedSoFar);
+            if (sharesAvailable > sharesStillNeeded) {
+                rewards_numShares[i] = rewards_numShares[i].sub(sharesStillNeeded);
+                return;
+            }
+
+            rewards_numShares[i] = rewards_numShares[i].sub(sharesAvailable);
+            totalSharesRemovedSoFar = totalSharesRemovedSoFar.add(sharesAvailable);
+            if (rewards_numShares[i] == 0) {
+                rewards_numShares[i] = rewards_numShares[rewards_numShares.length - 1];
+                rewards_vestingStart[i] = rewards_vestingStart[rewards_vestingStart.length - 1];
+                rewards_vestingDuration[i] = rewards_vestingDuration[rewards_vestingDuration.length - 1];
+                rewards_numShares.pop();
+                rewards_vestingStart.pop();
+                rewards_vestingDuration.pop();
+            } else {
+                i++;
+            }
+        }
     }
 
     function upgradeMultiplierLevel(uint256[] memory deposits)
@@ -174,6 +224,8 @@ contract CascadeV2 is OwnableUpgradeSafe {
                 totalDepositedLevel2 = totalDepositedLevel2.add(tokensDeposited);
                 totalDepositSeconds  = totalDepositSeconds.add(extraDepositSeconds);
 
+                userTotalLPTokensLevel1[msg.sender] = userTotalLPTokensLevel1[msg.sender].sub(tokensDeposited);
+                userTotalLPTokensLevel2[msg.sender] = userTotalLPTokensLevel2[msg.sender].add(tokensDeposited);
                 userDepositSeconds[msg.sender] = userDepositSeconds[msg.sender].add(extraDepositSeconds);
                 userDeposits_multiplierLevel[msg.sender][idx] = 2;
             }
@@ -185,11 +237,49 @@ contract CascadeV2 is OwnableUpgradeSafe {
                 totalDepositedLevel3 = totalDepositedLevel3.add(tokensDeposited);
                 totalDepositSeconds  = totalDepositSeconds.add(extraDepositSeconds);
 
+                userTotalLPTokensLevel2[msg.sender] = userTotalLPTokensLevel2[msg.sender].sub(tokensDeposited);
+                userTotalLPTokensLevel3[msg.sender] = userTotalLPTokensLevel3[msg.sender].add(tokensDeposited);
                 userDepositSeconds[msg.sender] = userDepositSeconds[msg.sender].add(extraDepositSeconds);
                 userDeposits_multiplierLevel[msg.sender][idx] = 3;
             }
             emit UpgradeMultiplierLevel(msg.sender, idx, oldLevel, userDeposits_multiplierLevel[msg.sender][idx], block.timestamp);
         }
+    }
+
+    function migrate(
+        address user,
+        uint256 numLPTokens,
+        uint256 numRewardTokens,
+        uint8   multiplier,
+        uint256 depositTimestamp,
+        uint256 depositSeconds
+    )
+        public
+    {
+        require(msg.sender == address(cascadeV1), "only cascade");
+        require(numLPTokens > 0, "no stake");
+
+        updateDepositSeconds(address(0x0));
+
+        userDeposits_numLPTokens[user].push(numLPTokens);
+        userDeposits_multiplierLevel[user].push(multiplier);
+        userDeposits_depositTimestamp[user].push(depositTimestamp);
+        userDepositSeconds[user] = depositSeconds;
+        userLastAccountingUpdateTimestamp[user] = now;
+        totalDepositSeconds = totalDepositSeconds.add(depositSeconds);
+
+        if (multiplier == 1) {
+            totalDepositedLevel1 = totalDepositedLevel1.add(numLPTokens);
+            userTotalLPTokensLevel1[user] = userTotalLPTokensLevel1[user].add(numLPTokens);
+        } else if (multiplier == 2) {
+            totalDepositedLevel2 = totalDepositedLevel2.add(numLPTokens);
+            userTotalLPTokensLevel2[user] = userTotalLPTokensLevel2[user].add(numLPTokens);
+        } else if (multiplier == 3) {
+            totalDepositedLevel3 = totalDepositedLevel3.add(numLPTokens);
+            userTotalLPTokensLevel3[user] = userTotalLPTokensLevel3[user].add(numLPTokens);
+        }
+
+        emit Migrate(user, numLPTokens, numRewardTokens);
     }
 
     /**
@@ -204,8 +294,46 @@ contract CascadeV2 is OwnableUpgradeSafe {
         userLastAccountingUpdateTimestamp[user] = now;
     }
 
-    function getUpdatedDepositSeconds(address user)
+    function unlockedRewardShares(uint256 rewardsIdx)
         private
+        view
+        returns (uint256)
+    {
+        if (rewards_vestingStart[rewardsIdx] >= now || rewards_numShares[rewardsIdx] == 0) {
+            return 0;
+        }
+        uint256 secondsIntoVesting = now.sub(rewards_vestingStart[rewardsIdx]);
+        if (secondsIntoVesting > rewards_vestingDuration[rewardsIdx]) {
+            return rewards_numShares[rewardsIdx];
+        } else {
+            return rewards_numShares[rewardsIdx].mul( secondsIntoVesting )
+                                                .div( rewards_vestingDuration[rewardsIdx] == 0 ? 1 : rewards_vestingDuration[rewardsIdx] );
+        }
+    }
+
+
+    function sharesToTokens(uint256 shares)
+        private
+        view
+        returns (uint256)
+    {
+        return shares.mul(BASE.totalSupply()).div(BASE.totalShares());
+    }
+
+     function tokensToShares(uint256 tokens)
+        private
+        view
+        returns (uint256)
+    {
+        return tokens.mul(BASE.totalShares().div(BASE.totalSupply()));
+    }
+
+    /**
+     * Getters
+     */
+
+    function getUpdatedDepositSeconds(address user)
+        public
         view
         returns (uint256 _totalDepositSeconds, uint256 _userDepositSeconds)
     {
@@ -222,10 +350,6 @@ contract CascadeV2 is OwnableUpgradeSafe {
                                                            ));
         return (_totalDepositSeconds, _userDepositSeconds);
     }
-
-    /**
-     * Getters
-     */
 
     function owedTo(address user)
         public
@@ -244,20 +368,11 @@ contract CascadeV2 is OwnableUpgradeSafe {
         view
         returns (uint256)
     {
-        uint256 baseBalance = BASE.balanceOf(address(this));
-        uint256 unlocked;
-        if (rewardsStartTimestamp > 0) {
-            uint256 secondsIntoVesting = now.sub(rewardsStartTimestamp);
-            if (secondsIntoVesting > rewardsDuration) {
-                unlocked = baseBalance;
-            } else {
-                unlocked = baseBalance.mul( now.sub(rewardsStartTimestamp) )
-                                 .div( rewardsDuration == 0 ? 1 : rewardsDuration );
-            }
-        } else {
-            unlocked = baseBalance;
+        uint256 totalShares;
+        for (uint256 i = 0; i < rewards_numShares.length; i++) {
+            totalShares = totalShares.add(unlockedRewardShares(i));
         }
-        return unlocked;
+        return sharesToTokens(totalShares);
     }
 
     function depositInfo(address user, uint256 depositIdx)
@@ -269,15 +384,16 @@ contract CascadeV2 is OwnableUpgradeSafe {
             uint8   _multiplierLevel,
             uint256 _userDepositSeconds,
             uint256 _totalDepositSeconds,
-            uint256 _owed,
+            uint256 _owed
         )
     {
+        (_totalDepositSeconds, _userDepositSeconds) = getUpdatedDepositSeconds(user);
         return (
-            userDeposits_numLPTokens[user][i],
-            userDeposits_depositTimestamp[user][i],
-            userDeposits_multiplierLevel[user][i],
-            userDepositSeconds,
-            totalDepositSeconds,
+            userDeposits_numLPTokens[user][depositIdx],
+            userDeposits_depositTimestamp[user][depositIdx],
+            userDeposits_multiplierLevel[user][depositIdx],
+            _userDepositSeconds,
+            _totalDepositSeconds,
             owedTo(user)
         );
     }

@@ -4,6 +4,18 @@ import "@openzeppelin/contracts-ethereum-package/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts-ethereum-package/contracts/Initializable.sol";
 import "./BaseToken.sol";
 
+interface ICascadeV1 {
+    function depositInfo(address user) external view
+        returns (
+            uint256 _lpTokensDeposited,
+            uint256 _depositTimestamp,
+            uint8   _multiplierLevel,
+            uint256 _mostRecentBASEWithdrawal,
+            uint256 _userDepositSeconds,
+            uint256 _totalDepositSeconds
+        );
+}
+
 /**
  * @title CascadeV2 is a liquidity mining contract.
  */
@@ -25,13 +37,14 @@ contract CascadeV2 is OwnableUpgradeSafe {
     uint256 public totalDepositSeconds;
     uint256 public lastAccountingUpdateTimestamp;
 
-    uint256[] public rewards_numShares;
-    uint256[] public rewards_vestingStart;
-    uint256[] public rewards_vestingDuration;
+    uint256[] public rewardsNumShares;
+    uint256[] public rewardsVestingStart;
+    uint256[] public rewardsVestingDuration;
+    uint256[] public rewardsSharesWithdrawn;
 
     IERC20 public lpToken;
     BaseToken public BASE;
-    address public cascadeV1;
+    ICascadeV1 public cascadeV1;
 
     event Deposit(address indexed user, uint256 tokens, uint256 timestamp);
     event Withdraw(address indexed user, uint256 withdrawnLPTokens, uint256 withdrawnBASETokens, uint256 timestamp);
@@ -47,11 +60,14 @@ contract CascadeV2 is OwnableUpgradeSafe {
     /**
      * @dev Called by the OpenZeppelin "upgrades" library to initialize the contract in lieu of a constructor.
      */
-    function initialize()
-        external
-        initializer
-    {
+    function initialize() external initializer {
         __Ownable_init();
+
+        // Copy over the rewards tranche from Cascade v1
+        rewardsNumShares.push(0);
+        rewardsVestingStart.push(1606763901);
+        rewardsVestingDuration.push(7776000);
+        rewardsSharesWithdrawn.push(0);
     }
 
     /**
@@ -62,10 +78,7 @@ contract CascadeV2 is OwnableUpgradeSafe {
      * @notice Changes the address of the LP token for which staking is allowed.
      * @param _lpToken The address of the LP token.
      */
-    function setLPToken(address _lpToken)
-        external
-        onlyOwner
-    {
+    function setLPToken(address _lpToken) external onlyOwner {
         require(_lpToken != address(0x0), "zero address");
         lpToken = IERC20(_lpToken);
         emit SetLPToken(_lpToken);
@@ -75,10 +88,7 @@ contract CascadeV2 is OwnableUpgradeSafe {
      * @notice Changes the address of the BASE token.
      * @param _baseToken The address of the BASE token.
      */
-    function setBASEToken(address _baseToken)
-        external
-        onlyOwner
-    {
+    function setBASEToken(address _baseToken) external onlyOwner {
         require(_baseToken != address(0x0), "zero address");
         BASE = BaseToken(_baseToken);
         emit SetBASEToken(_baseToken);
@@ -88,12 +98,9 @@ contract CascadeV2 is OwnableUpgradeSafe {
      * @notice Changes the address of Cascade v1 (for purposes of migration).
      * @param _cascadeV1 The address of Cascade v1.
      */
-    function setCascadeV1(address _cascadeV1)
-        external
-        onlyOwner
-    {
-        require(_cascadeV1 != address(0x0), "zero address");
-        cascadeV1 = _cascadeV1;
+    function setCascadeV1(address _cascadeV1) external onlyOwner {
+        require(address(_cascadeV1) != address(0x0), "zero address");
+        cascadeV1 = ICascadeV1(_cascadeV1);
         emit SetCascadeV1(_cascadeV1);
     }
 
@@ -103,10 +110,7 @@ contract CascadeV2 is OwnableUpgradeSafe {
      * @param recipient The recipient that the tokens will be sent to.
      * @param amount How many tokens to rescue.
      */
-    function adminRescueTokens(address token, address recipient, uint256 amount)
-        external
-        onlyOwner
-    {
+    function adminRescueTokens(address token, address recipient, uint256 amount) external onlyOwner {
         require(token != address(0x0), "zero address");
         require(recipient != address(0x0), "bad recipient");
         require(amount > 0, "zero amount");
@@ -123,22 +127,20 @@ contract CascadeV2 is OwnableUpgradeSafe {
      * @param vestingStart The timestamp upon which vesting of this tranche begins.
      * @param vestingDuration The duration over which the tokens fully unlock.
      */
-    function addRewards(uint256 numTokens, uint256 vestingStart, uint256 vestingDuration)
-        external
-        onlyOwner
-    {
+    function addRewards(uint256 numTokens, uint256 vestingStart, uint256 vestingDuration) external onlyOwner {
         require(numTokens > 0, "zero amount");
         require(vestingStart > 0, "zero vesting start");
 
         uint256 numShares = tokensToShares(numTokens);
-        rewards_numShares.push(numShares);
-        rewards_vestingStart.push(vestingStart);
-        rewards_vestingDuration.push(vestingDuration);
+        rewardsNumShares.push(numShares);
+        rewardsVestingStart.push(vestingStart);
+        rewardsVestingDuration.push(vestingDuration);
+        rewardsSharesWithdrawn.push(0);
 
         bool ok = BASE.transferFrom(msg.sender, address(this), numTokens);
         require(ok, "transfer");
 
-        emit AddRewards(numTokens, numShares, vestingStart, vestingDuration, rewards_numShares.length);
+        emit AddRewards(numTokens, numShares, vestingStart, vestingDuration, rewardsNumShares.length);
     }
 
     /**
@@ -149,9 +151,7 @@ contract CascadeV2 is OwnableUpgradeSafe {
      * @notice Allows a user to deposit LP tokens into the Cascade.
      * @param amount How many tokens to stake.
      */
-    function deposit(uint256 amount)
-        external
-    {
+    function deposit(uint256 amount) external {
         require(amount > 0, "zero amount");
 
         uint256 allowance = lpToken.allowance(msg.sender, address(this));
@@ -173,54 +173,23 @@ contract CascadeV2 is OwnableUpgradeSafe {
 
     /**
      * @notice Allows a user to withdraw LP tokens from the Cascade.
-     * @param amount How many tokens to unstake.
+     * @param numLPTokens How many tokens to unstake.
      */
-    function withdrawLPTokens(uint256 amount)
-        external
-    {
-        require(amount > 0, "zero amount");
+    function withdrawLPTokens(uint256 numLPTokens) external {
+        require(numLPTokens > 0, "zero tokens");
 
         updateDepositSeconds(msg.sender);
 
-        uint256 totalAmountToWithdraw;
-        uint256 totalDepositSecondsToBurn;
-        uint256 amountToWithdrawLevel1;
-        uint256 amountToWithdrawLevel2;
-        uint256 amountToWithdrawLevel3;
-        for (uint256 i = userDepositsNumLPTokens[msg.sender].length - 1; i >= 0; i++) {
-            uint256 lpTokens;
-            if (totalAmountToWithdraw.add(lpTokens) < amount) {
-                lpTokens = userDepositsNumLPTokens[msg.sender][i];
-                userDepositsNumLPTokens[msg.sender].pop();
-                userDepositsDepositTimestamp[msg.sender].pop();
-            } else {
-                lpTokens = amount.sub(totalAmountToWithdraw);
-                userDepositsNumLPTokens[msg.sender][i] = lpTokens.sub(lpTokens);
-            }
+        (
+            uint256 totalAmountToWithdraw,
+            uint256 totalDepositSecondsToBurn,
+            uint256 amountToWithdrawLevel1,
+            uint256 amountToWithdrawLevel2,
+            uint256 amountToWithdrawLevel3
+        ) = removeDepositSeconds(numLPTokens);
 
-            uint256 depositSecondsToBurn;
-            uint256 age = userDepositsDepositTimestamp[msg.sender][i];
-            uint8 multiplier = userDepositsMultiplierLevel[msg.sender][i];
-            if (multiplier == 1) {
-                userTotalLPTokensLevel1[msg.sender] = userTotalLPTokensLevel1[msg.sender].sub(lpTokens);
-                amountToWithdrawLevel1 = amountToWithdrawLevel1.add(lpTokens);
-                depositSecondsToBurn = depositSecondsToBurn.add(age.mul(lpTokens));
-            } else if (multiplier == 2) {
-                userTotalLPTokensLevel2[msg.sender] = userTotalLPTokensLevel2[msg.sender].sub(lpTokens);
-                amountToWithdrawLevel2 = amountToWithdrawLevel2.add(lpTokens);
-                depositSecondsToBurn = depositSecondsToBurn.add(age.mul(lpTokens).mul(2));
-            } else if (multiplier == 3) {
-                userTotalLPTokensLevel3[msg.sender] = userTotalLPTokensLevel3[msg.sender].sub(lpTokens);
-                amountToWithdrawLevel3 = amountToWithdrawLevel3.add(lpTokens);
-                depositSecondsToBurn = depositSecondsToBurn.add(age.mul(lpTokens).mul(3));
-            }
-
-            totalAmountToWithdraw = totalAmountToWithdraw.add(lpTokens);
-            totalDepositSecondsToBurn = totalDepositSecondsToBurn.add(depositSecondsToBurn);
-        }
-
-        uint256 rewardTokens = rewardsPool().mul( totalDepositSecondsToBurn.div(totalDepositSeconds) );
-        removeRewards(rewardTokens);
+        uint256 totalRewardShares = unlockedRewardsPoolShares().mul(totalDepositSecondsToBurn).div(totalDepositSeconds);
+        removeRewardShares(totalRewardShares);
 
         totalDepositedLevel1 = totalDepositedLevel1.sub(amountToWithdrawLevel1);
         totalDepositedLevel2 = totalDepositedLevel2.sub(amountToWithdrawLevel2);
@@ -228,6 +197,8 @@ contract CascadeV2 is OwnableUpgradeSafe {
 
         userDepositSeconds[msg.sender] = userDepositSeconds[msg.sender].sub(totalDepositSecondsToBurn);
         totalDepositSeconds = totalDepositSeconds.sub(totalDepositSecondsToBurn);
+
+        uint256 rewardTokens = sharesToTokens(totalRewardShares);
 
         bool ok = lpToken.transfer(msg.sender, totalAmountToWithdraw);
         require(ok, "transfer deposit");
@@ -237,31 +208,77 @@ contract CascadeV2 is OwnableUpgradeSafe {
         emit Withdraw(msg.sender, totalAmountToWithdraw, rewardTokens, block.timestamp);
     }
 
-    function removeRewards(uint256 rewardTokens)
-        private
+    function removeDepositSeconds(uint256 numLPTokens) private
+        returns (
+            uint256 totalAmountToWithdraw,
+            uint256 totalDepositSecondsToBurn,
+            uint256 amountToWithdrawLevel1,
+            uint256 amountToWithdrawLevel2,
+            uint256 amountToWithdrawLevel3
+        )
     {
-        uint256 totalSharesToRemove = tokensToShares(rewardTokens);
+        for (uint256 i = userDepositsNumLPTokens[msg.sender].length; i > 0; i--) {
+            uint256 lpTokensToRemove;
+            uint256 age = now.sub(userDepositsDepositTimestamp[msg.sender][i-1]);
+            uint8   multiplier = userDepositsMultiplierLevel[msg.sender][i-1];
+
+            if (totalAmountToWithdraw.add(userDepositsNumLPTokens[msg.sender][i-1]) <= numLPTokens) {
+                lpTokensToRemove = userDepositsNumLPTokens[msg.sender][i-1];
+                userDepositsNumLPTokens[msg.sender].pop();
+                userDepositsDepositTimestamp[msg.sender].pop();
+                userDepositsMultiplierLevel[msg.sender].pop();
+            } else {
+                lpTokensToRemove = numLPTokens.sub(totalAmountToWithdraw);
+                userDepositsNumLPTokens[msg.sender][i-1] = userDepositsNumLPTokens[msg.sender][i-1].sub(lpTokensToRemove);
+            }
+
+            uint256 depositSecondsToBurn;
+            if (multiplier == 1) {
+                userTotalLPTokensLevel1[msg.sender] = userTotalLPTokensLevel1[msg.sender].sub(lpTokensToRemove);
+                amountToWithdrawLevel1 = amountToWithdrawLevel1.add(lpTokensToRemove);
+                totalDepositSecondsToBurn = totalDepositSecondsToBurn.add(age.mul(lpTokensToRemove));
+            } else if (multiplier == 2) {
+                userTotalLPTokensLevel2[msg.sender] = userTotalLPTokensLevel2[msg.sender].sub(lpTokensToRemove);
+                amountToWithdrawLevel2 = amountToWithdrawLevel2.add(lpTokensToRemove);
+                totalDepositSecondsToBurn = totalDepositSecondsToBurn.add(lpTokensToRemove.mul(30 days + (age - 30 days).mul(2)));
+            } else if (multiplier == 3) {
+                userTotalLPTokensLevel3[msg.sender] = userTotalLPTokensLevel3[msg.sender].sub(lpTokensToRemove);
+                amountToWithdrawLevel3 = amountToWithdrawLevel3.add(lpTokensToRemove);
+                totalDepositSecondsToBurn = totalDepositSecondsToBurn.add(lpTokensToRemove.mul(30 days + uint256(30 days).mul(2) + (age - 60 days).mul(3)));
+            }
+            totalAmountToWithdraw = totalAmountToWithdraw.add(lpTokensToRemove);
+        }
+        return (
+            totalAmountToWithdraw,
+            totalDepositSecondsToBurn,
+            amountToWithdrawLevel1,
+            amountToWithdrawLevel2,
+            amountToWithdrawLevel3
+        );
+    }
+
+    function removeRewardShares(uint256 totalSharesToRemove) private {
         uint256 totalSharesRemovedSoFar;
-        uint256 i;
-        while (totalSharesRemovedSoFar < totalSharesToRemove) {
-            uint256 sharesAvailable = unlockedRewardShares(i);
+
+        for (uint256 i = rewardsNumShares.length; i > 0; i--) {
+            uint256 sharesAvailable = unlockedRewardSharesInTranche(i-1);
+            if (sharesAvailable == 0) {
+                continue;
+            }
+
             uint256 sharesStillNeeded = totalSharesToRemove.sub(totalSharesRemovedSoFar);
             if (sharesAvailable > sharesStillNeeded) {
-                rewards_numShares[i] = rewards_numShares[i].sub(sharesStillNeeded);
+                rewardsSharesWithdrawn[i-1] = rewardsSharesWithdrawn[i-1].add(sharesStillNeeded);
                 return;
             }
 
-            rewards_numShares[i] = rewards_numShares[i].sub(sharesAvailable);
+            rewardsSharesWithdrawn[i-1] = rewardsSharesWithdrawn[i-1].add(sharesAvailable);
             totalSharesRemovedSoFar = totalSharesRemovedSoFar.add(sharesAvailable);
-            if (rewards_numShares[i] == 0) {
-                rewards_numShares[i] = rewards_numShares[rewards_numShares.length - 1];
-                rewards_vestingStart[i] = rewards_vestingStart[rewards_vestingStart.length - 1];
-                rewards_vestingDuration[i] = rewards_vestingDuration[rewards_vestingDuration.length - 1];
-                rewards_numShares.pop();
-                rewards_vestingStart.pop();
-                rewards_vestingDuration.pop();
-            } else {
-                i++;
+            if (rewardsNumShares[i-1].sub(rewardsSharesWithdrawn[i-1]) == 0) {
+                rewardsNumShares.pop();
+                rewardsVestingStart.pop();
+                rewardsVestingDuration.pop();
+                rewardsSharesWithdrawn.pop();
             }
         }
     }
@@ -270,9 +287,7 @@ contract CascadeV2 is OwnableUpgradeSafe {
      * @notice Allows a user to upgrade their deposit-seconds multipler for the given deposits.
      * @param deposits A list of the indices of deposits to be upgraded.
      */
-    function upgradeMultiplierLevel(uint256[] memory deposits)
-        external
-    {
+    function upgradeMultiplierLevel(uint256[] memory deposits) external {
         require(deposits.length > 0, "no deposits");
 
         updateDepositSeconds(msg.sender);
@@ -320,37 +335,36 @@ contract CascadeV2 is OwnableUpgradeSafe {
     /**
      * @notice Called by Cascade v1 to migrate funds into Cascade v2.
      * @param user The user for whom to migrate funds.
-     * @param numLPTokens How many LP tokens to migrate.
-     * @param numRewardTokens How many BASE tokens to migrate.
-     * @param multiplier The user's current multiplier.
-     * @param depositTimestamp The timestamp of the user's v1 deposit.
-     * @param depositSeconds The user's current deposit-seconds.
      */
-    function migrate(
-        address user,
-        uint256 numLPTokens,
-        uint256 numRewardTokens,
-        uint8   multiplier,
-        uint256 depositTimestamp,
-        uint256 depositSeconds
-    )
-        external
-    {
-        require(msg.sender == cascadeV1, "only cascade v1");
+    function migrate(address user) external {
+        require(msg.sender == address(cascadeV1), "only cascade v1");
         require(user != address(0x0), "zero address");
+
+        (
+            uint256 numLPTokens,
+            uint256 depositTimestamp,
+            uint8   multiplier,
+            ,
+            uint256 userDS,
+            uint256 totalDS
+        ) = cascadeV1.depositInfo(user);
+        uint256 numRewardShares = BASE.sharesOf(address(cascadeV1)).mul(userDS).div(totalDS);
+
         require(numLPTokens > 0, "no stake");
         require(multiplier > 0, "zero multiplier");
         require(depositTimestamp > 0, "zero timestamp");
-        require(depositSeconds > 0, "zero seconds");
+        require(userDS > 0, "zero seconds");
 
         updateDepositSeconds(user);
 
         userDepositsNumLPTokens[user].push(numLPTokens);
         userDepositsMultiplierLevel[user].push(multiplier);
         userDepositsDepositTimestamp[user].push(depositTimestamp);
-        userDepositSeconds[user] = depositSeconds;
+        userDepositSeconds[user] = userDS;
         userLastAccountingUpdateTimestamp[user] = now;
-        totalDepositSeconds = totalDepositSeconds.add(depositSeconds);
+        totalDepositSeconds = totalDepositSeconds.add(userDS);
+
+        rewardsNumShares[0] = rewardsNumShares[0].add(numRewardShares);
 
         if (multiplier == 1) {
             totalDepositedLevel1 = totalDepositedLevel1.add(numLPTokens);
@@ -363,58 +377,18 @@ contract CascadeV2 is OwnableUpgradeSafe {
             userTotalLPTokensLevel3[user] = userTotalLPTokensLevel3[user].add(numLPTokens);
         }
 
-        emit Migrate(user, numLPTokens, numRewardTokens);
+        emit Migrate(user, numLPTokens, sharesToTokens(numRewardShares));
     }
-
-    /**
-     * Accounting utilities
-     */
 
     /**
      * @notice Updates the global deposit-seconds accounting as well as that of the given user.
      * @param user The user for whom to update the accounting.
      */
-    function updateDepositSeconds(address user)
-        public
-    {
+    function updateDepositSeconds(address user) public {
         (totalDepositSeconds, userDepositSeconds[user]) = getUpdatedDepositSeconds(user);
         lastAccountingUpdateTimestamp = now;
         userLastAccountingUpdateTimestamp[user] = now;
         emit UpdateDepositSeconds(user, totalDepositSeconds, userDepositSeconds[user]);
-    }
-
-    function unlockedRewardShares(uint256 rewardsIdx)
-        private
-        view
-        returns (uint256)
-    {
-        if (rewards_vestingStart[rewardsIdx] >= now || rewards_numShares[rewardsIdx] == 0) {
-            return 0;
-        }
-        uint256 secondsIntoVesting = now.sub(rewards_vestingStart[rewardsIdx]);
-        if (secondsIntoVesting > rewards_vestingDuration[rewardsIdx]) {
-            return rewards_numShares[rewardsIdx];
-        } else {
-            return rewards_numShares[rewardsIdx].mul( secondsIntoVesting )
-                                                .div( rewards_vestingDuration[rewardsIdx] == 0 ? 1 : rewards_vestingDuration[rewardsIdx] );
-        }
-    }
-
-
-    function sharesToTokens(uint256 shares)
-        private
-        view
-        returns (uint256)
-    {
-        return shares.mul(BASE.totalSupply()).div(BASE.totalShares());
-    }
-
-     function tokensToShares(uint256 tokens)
-        private
-        view
-        returns (uint256)
-    {
-        return tokens.mul(BASE.totalShares().div(BASE.totalSupply()));
     }
 
     /**
@@ -425,22 +399,16 @@ contract CascadeV2 is OwnableUpgradeSafe {
      * @notice Returns the global deposit-seconds as well as that of the given user.
      * @param user The user for whom to fetch the current deposit-seconds.
      */
-    function getUpdatedDepositSeconds(address user)
-        public
-        view
-        returns (uint256 _totalDepositSeconds, uint256 _userDepositSeconds)
-    {
+    function getUpdatedDepositSeconds(address user) public view returns (uint256 _totalDepositSeconds, uint256 _userDepositSeconds) {
         uint256 delta = now.sub(lastAccountingUpdateTimestamp);
         _totalDepositSeconds = totalDepositSeconds.add(delta.mul(totalDepositedLevel1
                                                                        .add( totalDepositedLevel2.mul(2) )
-                                                                       .add( totalDepositedLevel3.mul(3) )
-                                                      ));
+                                                                       .add( totalDepositedLevel3.mul(3) ) ));
 
         delta = now.sub(userLastAccountingUpdateTimestamp[user]);
         _userDepositSeconds  = userDepositSeconds[user].add(delta.mul(userTotalLPTokensLevel1[user]
                                                                        .add( userTotalLPTokensLevel2[user].mul(2) )
-                                                                       .add( userTotalLPTokensLevel3[user].mul(3) )
-                                                           ));
+                                                                       .add( userTotalLPTokensLevel3[user].mul(3) ) ));
         return (_totalDepositSeconds, _userDepositSeconds);
     }
 
@@ -448,33 +416,52 @@ contract CascadeV2 is OwnableUpgradeSafe {
      * @notice Returns the BASE rewards owed to the given user.
      * @param user The user for whom to fetch the current rewards.
      */
-    function owedTo(address user)
-        public
-        view
-        returns (uint256)
-    {
+    function owedTo(address user) public view returns (uint256) {
         require(user != address(0x0), "zero address");
 
         (uint256 totalDS, uint256 userDS) = getUpdatedDepositSeconds(user);
         if (totalDS == 0) {
             return 0;
         }
-        return rewardsPool().mul(userDS).div(totalDS);
+        return sharesToTokens(unlockedRewardsPoolShares().mul(userDS).div(totalDS));
     }
 
     /**
-     * @notice Returns the total rewards pool.
+     * @notice Returns the total number of unlocked BASE in the rewards pool.
      */
-    function rewardsPool()
-        public
-        view
-        returns (uint256)
-    {
+    function unlockedRewardsPoolTokens() public view returns (uint256) {
+        return sharesToTokens(unlockedRewardsPoolShares());
+    }
+
+    function unlockedRewardsPoolShares() private view returns (uint256) {
         uint256 totalShares;
-        for (uint256 i = 0; i < rewards_numShares.length; i++) {
-            totalShares = totalShares.add(unlockedRewardShares(i));
+        for (uint256 i = 0; i < rewardsNumShares.length; i++) {
+            totalShares = totalShares.add(unlockedRewardSharesInTranche(i));
         }
-        return sharesToTokens(totalShares);
+        return totalShares;
+    }
+
+    function unlockedRewardSharesInTranche(uint256 rewardsIdx) private view returns (uint256) {
+        if (rewardsVestingStart[rewardsIdx] >= now || rewardsNumShares[rewardsIdx].sub(rewardsSharesWithdrawn[rewardsIdx]) == 0) {
+            return 0;
+        }
+        uint256 secondsIntoVesting = now.sub(rewardsVestingStart[rewardsIdx]);
+        uint256 shares;
+        if (secondsIntoVesting > rewardsVestingDuration[rewardsIdx]) {
+            return rewardsNumShares[rewardsIdx].sub(rewardsSharesWithdrawn[rewardsIdx]);
+        } else {
+            return rewardsNumShares[rewardsIdx].mul( secondsIntoVesting )
+                                                .div( rewardsVestingDuration[rewardsIdx] == 0 ? 1 : rewardsVestingDuration[rewardsIdx] )
+                                                .sub( rewardsSharesWithdrawn[rewardsIdx] );
+        }
+    }
+
+    function sharesToTokens(uint256 shares) private view returns (uint256) {
+        return shares.mul(BASE.totalSupply()).div(BASE.totalShares());
+    }
+
+     function tokensToShares(uint256 tokens) private view returns (uint256) {
+        return tokens.mul(BASE.totalShares().div(BASE.totalSupply()));
     }
 
     /**
@@ -482,9 +469,7 @@ contract CascadeV2 is OwnableUpgradeSafe {
      * @param user The user to fetch.
      * @param depositIdx The index of the given user's deposit to fetch.
      */
-    function depositInfo(address user, uint256 depositIdx)
-        public
-        view
+    function depositInfo(address user, uint256 depositIdx) public view
         returns (
             uint256 _numLPTokens,
             uint256 _depositTimestamp,

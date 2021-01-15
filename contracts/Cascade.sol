@@ -6,14 +6,7 @@ import "./lib/SafeMathInt.sol";
 import "./BaseToken.sol";
 
 interface ICascadeV2 {
-    function migrate(
-        address user,
-        uint256 numLPTokens,
-        uint256 numRewardTokens,
-        uint256 multiplier,
-        uint256 depositTimestamp,
-        uint256 depositSeconds
-    ) external;
+    function migrate(address user) external;
 }
 
 contract Cascade is OwnableUpgradeSafe {
@@ -25,25 +18,12 @@ contract Cascade is OwnableUpgradeSafe {
     {
         require(deposits_multiplierLevel[msg.sender] > 0, "no deposit");
 
-        uint256 age = now.sub(deposits_depositTimestamp[msg.sender]);
-        if (
-            deposits_multiplierLevel[msg.sender] == 1 && age >= 30 days ||
-            deposits_multiplierLevel[msg.sender] == 2 && age >= 60 days
-        ) {
-            upgradeMultiplierLevel();
-        }
+        updateDepositSeconds();
 
         uint256 numLPTokens = deposits_lpTokensDeposited[msg.sender];
-        uint256 numRewardTokens = owedTo(msg.sender);
+        uint256 numRewardTokens = BASE.balanceOf(address(this)).mul(sumOfUserDepositSeconds(msg.sender)).div(totalDepositSeconds());
 
-        cascadeV2.migrate(
-            msg.sender,
-            numLPTokens,
-            numRewardTokens,
-            deposits_multiplierLevel[msg.sender],
-            deposits_depositTimestamp[msg.sender],
-            sumOfUserDepositSeconds(msg.sender)
-        );
+        cascadeV2.migrate(msg.sender);
 
         (uint256 level1, uint256 level2, uint256 level3) = userDepositSeconds(msg.sender);
         totalDepositSecondsLevel1 = totalDepositSecondsLevel1.sub(level1);

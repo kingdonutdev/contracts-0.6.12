@@ -22,6 +22,7 @@ interface ICascadeV1 {
 contract CascadeV2 is OwnableUpgradeSafe {
     using SafeMath for uint256;
 
+    mapping(address => uint256)   public userDepositsNumDeposits;
     mapping(address => uint256[]) public userDepositsNumLPTokens;
     mapping(address => uint256[]) public userDepositsDepositTimestamp;
     mapping(address => uint8[])   public userDepositsMultiplierLevel;
@@ -160,6 +161,7 @@ contract CascadeV2 is OwnableUpgradeSafe {
         updateDepositSeconds(msg.sender);
 
         totalDepositedLevel1 = totalDepositedLevel1.add(amount);
+        userDepositsNumDeposits[msg.sender] = userDepositsNumDeposits[msg.sender].add(1);
         userTotalLPTokensLevel1[msg.sender] = userTotalLPTokensLevel1[msg.sender].add(amount);
         userDepositsNumLPTokens[msg.sender].push(amount);
         userDepositsDepositTimestamp[msg.sender].push(now);
@@ -224,6 +226,7 @@ contract CascadeV2 is OwnableUpgradeSafe {
 
             if (totalAmountToWithdraw.add(userDepositsNumLPTokens[msg.sender][i-1]) <= numLPTokens) {
                 lpTokensToRemove = userDepositsNumLPTokens[msg.sender][i-1];
+                userDepositsNumDeposits[msg.sender] = userDepositsNumDeposits[msg.sender].sub(1);
                 userDepositsNumLPTokens[msg.sender].pop();
                 userDepositsDepositTimestamp[msg.sender].pop();
                 userDepositsMultiplierLevel[msg.sender].pop();
@@ -232,7 +235,6 @@ contract CascadeV2 is OwnableUpgradeSafe {
                 userDepositsNumLPTokens[msg.sender][i-1] = userDepositsNumLPTokens[msg.sender][i-1].sub(lpTokensToRemove);
             }
 
-            uint256 depositSecondsToBurn;
             if (multiplier == 1) {
                 userTotalLPTokensLevel1[msg.sender] = userTotalLPTokensLevel1[msg.sender].sub(lpTokensToRemove);
                 amountToWithdrawLevel1 = amountToWithdrawLevel1.add(lpTokensToRemove);
@@ -247,6 +249,10 @@ contract CascadeV2 is OwnableUpgradeSafe {
                 totalDepositSecondsToBurn = totalDepositSecondsToBurn.add(lpTokensToRemove.mul(30 days + uint256(30 days).mul(2) + (age - 60 days).mul(3)));
             }
             totalAmountToWithdraw = totalAmountToWithdraw.add(lpTokensToRemove);
+
+            if (totalAmountToWithdraw >= numLPTokens) {
+                break;
+            }
         }
         return (
             totalAmountToWithdraw,
@@ -357,6 +363,7 @@ contract CascadeV2 is OwnableUpgradeSafe {
 
         updateDepositSeconds(user);
 
+        userDepositsNumDeposits[msg.sender] = userDepositsNumDeposits[msg.sender].add(1);
         userDepositsNumLPTokens[user].push(numLPTokens);
         userDepositsMultiplierLevel[user].push(multiplier);
         userDepositsDepositTimestamp[user].push(depositTimestamp);
@@ -446,13 +453,12 @@ contract CascadeV2 is OwnableUpgradeSafe {
             return 0;
         }
         uint256 secondsIntoVesting = now.sub(rewardsVestingStart[rewardsIdx]);
-        uint256 shares;
         if (secondsIntoVesting > rewardsVestingDuration[rewardsIdx]) {
             return rewardsNumShares[rewardsIdx].sub(rewardsSharesWithdrawn[rewardsIdx]);
         } else {
             return rewardsNumShares[rewardsIdx].mul( secondsIntoVesting )
-                                                .div( rewardsVestingDuration[rewardsIdx] == 0 ? 1 : rewardsVestingDuration[rewardsIdx] )
-                                                .sub( rewardsSharesWithdrawn[rewardsIdx] );
+                                               .div( rewardsVestingDuration[rewardsIdx] == 0 ? 1 : rewardsVestingDuration[rewardsIdx] )
+                                               .sub( rewardsSharesWithdrawn[rewardsIdx] );
         }
     }
 

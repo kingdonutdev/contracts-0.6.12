@@ -7,10 +7,14 @@ async function main() {
 
   const DogeOracle = await ethers.getContractFactory("DogeOracle");
 
-  const mcapOracle = await DogeOracle.deploy("Market Cap Oracle");
-  await mcapOracle.deployed();
-  console.log("Market cap oracle deployed to:", mcapOracle.address);
-  saveContractAddress(bre.network.name, "mcapOracle", mcapOracle.address);
+  const targetPriceOracle = await DogeOracle.deploy("Target Price Oracle");
+  await targetPriceOracle.deployed();
+  console.log("Target price oracle deployed to:", targetPriceOracle.address);
+  saveContractAddress(
+    bre.network.name,
+    "targetPriceOracle",
+    targetPriceOracle.address
+  );
 
   const tokenPriceOracle = await DogeOracle.deploy("Token Price Oracle");
   await tokenPriceOracle.deployed();
@@ -50,7 +54,9 @@ async function main() {
   );
 
   await (
-    await dogeRebaseTokenMonetaryPolicy.setMcapOracle(mcapOracle.address)
+    await dogeRebaseTokenMonetaryPolicy.setTargetPriceOracle(
+      targetPriceOracle.address
+    )
   ).wait();
   await (
     await dogeRebaseTokenMonetaryPolicy.setTokenPriceOracle(

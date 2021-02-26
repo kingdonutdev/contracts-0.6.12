@@ -5,7 +5,7 @@ import "@openzeppelin/contracts-ethereum-package/contracts/Initializable.sol";
 
 import "../lib/SafeMathInt.sol";
 import "../lib/UInt256Lib.sol";
-import "../BaseToken.sol";
+import "./DogeRebaseToken.sol";
 
 
 interface IOracle {
@@ -30,15 +30,15 @@ contract DogeRebaseTokenMonetaryPolicy is OwnableUpgradeSafe {
     event LogRebase(
         uint256 indexed epoch,
         uint256 exchangeRate,
-        uint256 mcap,
+        uint256 targetPrice,
         int256 requestedSupplyAdjustment,
         uint256 timestampSec
     );
 
-    BaseToken public BASE;
+    DogeRebaseToken public BASE;
 
-    // Provides the current market cap, as an 18 decimal fixed point number.
-    IOracle public mcapOracle;
+    // Provides the target price, as an 18 decimal fixed point number.
+    IOracle public targetPriceOracle;
 
     // Market oracle provides the token/USD exchange rate as an 18 decimal fixed point number.
     // (eg) An oracle value of 1.5e18 it would mean 1 BASE is trading for $1.50.
@@ -94,7 +94,7 @@ contract DogeRebaseTokenMonetaryPolicy is OwnableUpgradeSafe {
         public
         onlyOwner
     {
-        BASE = BaseToken(_BASE);
+        BASE = DogeRebaseToken(_BASE);
     }
 
     /**
@@ -117,11 +117,11 @@ contract DogeRebaseTokenMonetaryPolicy is OwnableUpgradeSafe {
         epoch = epoch.add(1);
 
         int256 supplyDelta;
-        uint256 mcap;
+        uint256 targetPrice;
         uint256 tokenPrice;
-        (supplyDelta, mcap, tokenPrice) = getNextSupplyDelta();
+        (supplyDelta, targetPrice, tokenPrice) = getNextSupplyDelta();
         if (supplyDelta == 0) {
-            emit LogRebase(epoch, tokenPrice, mcap, supplyDelta, now);
+            emit LogRebase(epoch, tokenPrice, targetPrice, supplyDelta, now);
             return;
         }
 
@@ -131,18 +131,18 @@ contract DogeRebaseTokenMonetaryPolicy is OwnableUpgradeSafe {
 
         uint256 nextSupply = BASE.rebase(epoch, supplyDelta);
         assert(nextSupply <= MAX_SUPPLY);
-        emit LogRebase(epoch, tokenPrice, mcap, supplyDelta, now);
+        emit LogRebase(epoch, tokenPrice, targetPrice, supplyDelta, now);
     }
 
     function getNextSupplyDelta()
         public
         view
-        returns (int256 supplyDelta, uint256 mcap, uint256 tokenPrice)
+        returns (int256 supplyDelta, uint256 targetPrice, uint256 tokenPrice)
     {
-        uint256 mcap;
-        bool mcapValid;
-        (mcap, mcapValid) = mcapOracle.getData();
-        require(mcapValid, "invalid mcap");
+        uint256 targetPrice;
+        bool targetPriceValid;
+        (targetPrice, targetPriceValid) = targetPriceOracle.getData();
+        require(targetPriceValid, "invalid target price");
 
         uint256 tokenPrice;
         bool tokenPriceValid;
@@ -153,22 +153,22 @@ contract DogeRebaseTokenMonetaryPolicy is OwnableUpgradeSafe {
             tokenPrice = MAX_RATE;
         }
 
-        supplyDelta = computeSupplyDelta(tokenPrice, mcap);
+        supplyDelta = computeSupplyDelta(tokenPrice, targetPrice);
 
         // Apply the Dampening factor.
         supplyDelta = supplyDelta.div(rebaseLag.toInt256Safe());
-        return (supplyDelta, mcap, tokenPrice);
+        return (supplyDelta, targetPrice, tokenPrice);
     }
 
     /**
      * @notice Sets the reference to the market cap oracle.
-     * @param mcapOracle_ The address of the mcap oracle contract.
+     * @param targetPriceOracle_ The address of the target price oracle contract.
      */
-    function setMcapOracle(IOracle mcapOracle_)
+    function setTargetPriceOracle(IOracle targetPriceOracle_)
         external
         onlyOwner
     {
-        mcapOracle = mcapOracle_;
+        targetPriceOracle = targetPriceOracle_;
     }
 
     /**
@@ -254,7 +254,7 @@ contract DogeRebaseTokenMonetaryPolicy is OwnableUpgradeSafe {
      *      It is called at the time of contract creation to invoke parent class initializers and
      *      initialize the contract's state variables.
      */
-    function initialize(BaseToken BASE_)
+    function initialize(DogeRebaseToken BASE_)
         public
         initializer
     {
@@ -286,21 +286,21 @@ contract DogeRebaseTokenMonetaryPolicy is OwnableUpgradeSafe {
      * @return Computes the total supply adjustment in response to the exchange rate
      *         and the targetRate.
      */
-    function computeSupplyDelta(uint256 price, uint256 mcap)
+    function computeSupplyDelta(uint256 price, uint256 targetPrice)
         public
         view
         returns (int256)
     {
-        if (withinDeviationThreshold(price, mcap.div(1000000000000))) {
+        if (withinDeviationThreshold(price, targetPrice)) {
             return 0;
         }
 
         // supplyDelta = totalSupply * (price - targetPrice) / targetPrice
-        int256 pricex1T       = price.mul(1000000000000).toInt256Safe();
-        int256 targetPricex1T = mcap.toInt256Safe();
+        int256 sPrice = price.toInt256Safe();
+        int256 sTargetPrice = targetPrice.toInt256Safe();
         return BASE.totalSupply().toInt256Safe()
-            .mul(pricex1T.sub(targetPricex1T))
-            .div(targetPricex1T);
+            .mul(sPrice.sub(sTargetPrice))
+            .div(sTargetPrice);
     }
 
     /**

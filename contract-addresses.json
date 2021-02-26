@@ -12,10 +12,11 @@
         "mcapOracle": "0xEC8761a0A73c34329CA5B1D3Dc7eD07F30e836e2"
     },
     "bscTestnet": {
-        "mcapOracle": "0xE917b68B4c8566fD7a70B17853c15e5de10D83df",
-        "tokenPriceOracle": "0xD7b86cf3c34B5822451a884FeaA70E2FCe62A068",
-        "dogeRebaseToken": "0xDD2E64Adca83d98118eC51c139424b09497e1524",
-        "dogeRebaseTokenMonetaryPolicy": "0x0491977FFe2e0F9Bf2D7Ed7b81376EC5Af71518b",
-        "dogeRebaseTokenOrchestrator": "0x06F6eaA2d0c47B467EB2357B1153B7CC02474989"
+        "mcapOracle": "0x874dd5B30Fa9F01117c1B823fa3429b784CfCc78",
+        "tokenPriceOracle": "0x91aecBF958b9632A883b89c612eCf9C391943d4C",
+        "dogeRebaseToken": "0xE0AC2c24C6c1af987B14Be6b147a21e9F460A15A",
+        "dogeRebaseTokenMonetaryPolicy": "0xeCeBc8050590Dac16EA24625F97db8c0fe455074",
+        "dogeRebaseTokenOrchestrator": "0x8308665EdC0e18647C7674De72252535F3fCE66D",
+        "targetPriceOracle": "0xF3a09E35d782A5516610ee0F307b6b5AFE236c7a"
     }
 }

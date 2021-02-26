@@ -59,7 +59,7 @@ contract DogeRebaseToken is ERC20UpgradeSafe, ERC677Token, OwnableUpgradeSafe {
 
     uint256 private constant DECIMALS = 9;
     uint256 private constant MAX_UINT256 = ~uint256(0);
-    uint256 private constant INITIAL_SUPPLY = 8795645 * 10**DECIMALS;
+    uint256 private constant INITIAL_SUPPLY = 100000000 * 10**DECIMALS;
     uint256 private constant INITIAL_SHARES = (MAX_UINT256 / (10 ** 36)) - ((MAX_UINT256 / (10 ** 36)) % INITIAL_SUPPLY);
     uint256 private constant MAX_SUPPLY = ~uint128(0);  // (2^128) - 1
 
@@ -138,9 +138,9 @@ contract DogeRebaseToken is ERC20UpgradeSafe, ERC677Token, OwnableUpgradeSafe {
 
         emit LogRebase(epoch, _totalSupply);
 
-        ISync(0xdE5b7Ff5b10CC5F8c95A2e2B643e3aBf5179C987).sync();              // Uniswap BASE/ETH
-        ISync(0xD8B8B575c943f3d63638c9563B464D204ED8B710).sync();              // Sushiswap BASE/ETH
-        IGulp(0x19B770c8F9d5439C419864d8458255791f7e736C).gulp(address(this)); // Value BASE/USDC
+        //ISync(0xdE5b7Ff5b10CC5F8c95A2e2B643e3aBf5179C987).sync();              // Uniswap BASE/ETH
+        //ISync(0xD8B8B575c943f3d63638c9563B464D204ED8B710).sync();              // Sushiswap BASE/ETH
+        //IGulp(0x19B770c8F9d5439C419864d8458255791f7e736C).gulp(address(this)); // Value BASE/USDC
 
         return _totalSupply;
     }
@@ -165,7 +165,7 @@ contract DogeRebaseToken is ERC20UpgradeSafe, ERC677Token, OwnableUpgradeSafe {
         public
         initializer
     {
-        __ERC20_init("Base Protocol", "BASE");
+        __ERC20_init("Doge Rebase Token", "DRT");
         _setupDecimals(uint8(DECIMALS));
         __Ownable_init();
 
